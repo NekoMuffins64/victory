@@ -160,40 +160,53 @@ fn far_jump<'a>(
     len: usize,
 ) -> Result<Option<usize>, ShaderError> {
     let n = setpc.words[0] & 0xFF;
-    let mut delta = None;
     let mut at = setpc.offset;
-    for _ in 0..4 {
-        let Some(prev) = before(at) else {
-            break;
-        };
-        if prev.offset + 4 * prev.words.len() != at {
-            break;
+    let mut previous = || {
+        let inst = before(at)?;
+        if inst.offset + 4 * inst.words.len() != at {
+            return None;
         }
-        let w = prev.words[0];
-        let (sdst, ssrc0, ssrc1) = ((w >> 16) & 0x7F, w & 0xFF, (w >> 8) & 0xFF);
-        match (prev.encoding, prev.name()) {
-            (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
-                if sdst == n && ssrc0 == n && ssrc1 == 0xFF && delta.is_none() =>
-            {
-                // The low dword of a signed 64-bit offset: a backward jump
-                // adds a negative one (its high dword is -1).
-                let literal = i64::from(prev.words[1] as i32);
-                delta = Some(if op == "s_add_u32" { literal } else { -literal });
-            }
-            (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
-                let Some(delta) = delta else { break };
-                // s_getpc_b64 yields the address of the instruction after it.
-                return usize::try_from(prev.offset as i64 + 4 + delta)
-                    .ok()
-                    .filter(|&t| t < len)
-                    .map(Some)
-                    .ok_or(isa(setpc.offset, "far jump target outside the code"));
-            }
-            _ => {}
-        }
-        at = prev.offset;
+        at = inst.offset;
+        Some(inst)
+    };
+    let (Some(high), Some(low), Some(base)) = (previous(), previous(), previous()) else {
+        return Ok(None);
+    };
+
+    // Each half must update the same register pair that getpc wrote and
+    // setpc reads. An intervening instruction can replace a half or SCC.
+    let updates = |inst: &Instruction, reg| {
+        let w = inst.words[0];
+        (w >> 16) & 0x7F == reg && w & 0xFF == reg
+    };
+    if base.name() != Some("s_getpc_b64")
+        || (base.words[0] >> 16) & 0x7F != n
+        || !updates(low, n)
+        || !updates(high, n + 1)
+        || (low.words[0] >> 8) & 0xFF != 0xFF
+    {
+        return Ok(None);
     }
-    Ok(None)
+    // The compiler uses an inline 0 or -1 for the high dword.
+    let upper = match (high.words[0] >> 8) & 0xFF {
+        0x80 => 0i64,
+        0xC1 => -1i64,
+        _ => return Ok(None),
+    };
+    let Some(&lower) = low.words.get(1) else {
+        return Ok(None);
+    };
+    let literal = (upper << 32) | i64::from(lower);
+    let delta = match (low.name(), high.name()) {
+        (Some("s_add_u32"), Some("s_addc_u32")) => literal,
+        (Some("s_sub_u32"), Some("s_subb_u32")) => -literal,
+        _ => return Ok(None),
+    };
+    usize::try_from(base.offset as i64 + 4 + delta)
+        .ok()
+        .filter(|&t| t < len)
+        .map(Some)
+        .ok_or(isa(setpc.offset, "far jump target outside the code"))
 }
 
 fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
@@ -473,6 +486,20 @@ mod tests {
                 (24, "s_setpc_b64"),
             ]
         );
+    }
+
+    #[test]
+    fn overwritten_far_jump_target_stays_indirect() {
+        let code = [
+            0xBE88_1F00, // s_getpc_b64 s[8:9]
+            0x8008_FF08,
+            20,          // s_add_u32 s8, s8, 20
+            0x8209_8009, // s_addc_u32 s9, s9, 0
+            0xBE88_040A, // s_mov_b64 s[8:9], s[10:11]
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // data at the discarded target
+        ];
+        assert_eq!(summary(&code).last().unwrap().2, "s_setpc_b64");
     }
 
     #[test]
