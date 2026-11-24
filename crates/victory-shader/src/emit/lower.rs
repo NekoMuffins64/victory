@@ -2500,26 +2500,31 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 (self.s.m.bin(c, Bin::Xor, a, ones), None)
             }
-            "s_add_u32" | "s_add_i32" | "s_addk_i32" => {
+            "s_add_u32" | "s_sub_u32" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (r, carry) = self.add_sub_carry(c, name == "s_add_u32", a, b, None);
+                (r, Some(carry))
+            }
+            "s_add_i32" | "s_addk_i32" | "s_sub_i32" => {
                 let a = src32(self, 0)?;
                 let b = if name == "s_addk_i32" {
                     sext16(self)
                 } else {
                     src32(self, 1)?
                 };
-                let r = self.s.m.bin(c, Bin::Add, a, b);
-                let carry = if name == "s_add_u32" {
-                    Some(self.s.m.cmp(c, pred::IULT, r, a))
-                } else {
-                    None
-                };
-                (r, carry)
-            }
-            "s_sub_u32" | "s_sub_i32" => {
-                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let r = self.s.m.bin(c, Bin::Sub, a, b);
-                let carry = (name == "s_sub_u32").then(|| self.s.m.cmp(c, pred::IULT, a, b));
-                (r, carry)
+                let sub = name == "s_sub_i32";
+                let r = self.s.m.bin(c, if sub { Bin::Sub } else { Bin::Add }, a, b);
+                // Without signed overflow, adding a negative b decreases a,
+                // and subtracting a negative b increases it. Wrap reverses
+                // that comparison in both cases.
+                let zero = self.s.m.i32(0);
+                let negative = self.s.m.cmp(c, pred::SLT, b, zero);
+                let direction = self
+                    .s
+                    .m
+                    .cmp(c, if sub { pred::SGT } else { pred::SLT }, r, a);
+                let overflow = self.s.m.bin(c, Bin::Xor, direction, negative);
+                (r, Some(overflow))
             }
             "s_addc_u32" | "s_subb_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -6596,6 +6601,25 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    #[test]
+    fn signed_scalar_overflow_reaches_a_branch() {
+        for op in [
+            0x8100_8100, // s_add_i32 s0, s0, 1
+            0x8180_C100, // s_sub_i32 s0, s0, -1
+            0xB780_0001, // s_addk_i32 s0, 1
+        ] {
+            lowers(&[
+                0xBE80_03FF,
+                0x7FFF_FFFF, // s_mov_b32 s0, INT_MAX
+                op,
+                0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+                0xBE81_0380, // s_mov_b32 s1, 0
+                S_ENDPGM,
+            ])
+            .unwrap();
+        }
     }
 
     #[test]
